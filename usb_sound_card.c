@@ -52,7 +52,7 @@ static char *descriptor_strings[] =
 #undef AUDIO_SAMPLE_FREQ
 #define AUDIO_SAMPLE_FREQ(frq) (uint8_t)(frq), (uint8_t)((frq >> 8)), (uint8_t)((frq >> 16))
 
-#define AUDIO_MAX_PACKET_SIZE ((96 + 1) * 4 * 2)
+#define AUDIO_MAX_PACKET_SIZE MAX((96 + 1) * 3 * 2, (48 + 1) * 4 * 2)
 #define FEATURE_MUTE_CONTROL 1u
 #define FEATURE_VOLUME_CONTROL 2u
 
@@ -101,7 +101,7 @@ struct audio_device_config {
         USB_Audio_StdDescriptor_Interface_AS_t streaming;
         struct __packed {
             USB_Audio_StdDescriptor_Format_t core;
-            USB_Audio_SampleFreq_t freqs[4];
+            USB_Audio_SampleFreq_t freqs[2];
         } format;
     } as_audio_3;
     struct __packed {
@@ -358,9 +358,7 @@ static const struct audio_device_config audio_device_config = {
                         },
                         .freqs = {
                                 AUDIO_SAMPLE_FREQ(44100),
-                                AUDIO_SAMPLE_FREQ(48000),
-                                AUDIO_SAMPLE_FREQ(88200),
-                                AUDIO_SAMPLE_FREQ(96000)
+                                AUDIO_SAMPLE_FREQ(48000)
                         },
                 },
         },
