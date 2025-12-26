@@ -50,7 +50,7 @@ static char *descriptor_strings[] =
 #undef AUDIO_SAMPLE_FREQ
 #define AUDIO_SAMPLE_FREQ(frq) (uint8_t)(frq), (uint8_t)((frq >> 8)), (uint8_t)((frq >> 16))
 
-#define AUDIO_MAX_PACKET_SIZE ((96 + 1) * 4 * 2)
+#define AUDIO_MAX_PACKET_SIZE MAX((96 + 1) * 3 * 2, (48 + 1) * 4 * 2)
 #define FEATURE_MUTE_CONTROL 1u
 #define FEATURE_VOLUME_CONTROL 2u
 
