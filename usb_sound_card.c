@@ -439,7 +439,12 @@ static void _as_audio_packet(struct usb_endpoint *ep) {
     // todo deal with blocking correctly
     DEBUG_PINS_CLR(audio_timing, 1);
     assert(!(usb_buffer->data_len & 3u));
-    i2s_enqueue(usb_buffer->data, usb_buffer->data_len, audio_state.resolution);
+
+    int32_t buf_l[I2S_QUEUE_MAX];
+    int32_t buf_r[I2S_QUEUE_MAX];
+    int length = i2s_unpack_uacdata(usb_buffer->data, usb_buffer->data_len, audio_state.resolution, buf_l, buf_r);
+    i2s_volume(buf_l, buf_r, length);
+    i2s_enqueue(buf_l, buf_r, length);
 
     // keep on truckin'
     usb_grow_transfer(ep->current_transfer, 1);
@@ -455,8 +460,9 @@ static void _as_sync_packet(struct usb_endpoint *ep) {
     buffer->data_len = 3;
 
     // todo lie thru our teeth for now
-    uint8_t length =  i2s_get_buf_length();
-    int32_t adjust = ((I2S_TARGET_LEVEL - (int32_t)length) * (int32_t)audio_state.freq / I2S_BUF_DEPTH) >> 7;
+    int length =  i2s_get_queue_length();
+    int trget_level = I2S_DEQUEUE_LEN * 5;
+    int32_t adjust = ((trget_level - length) * (int32_t)audio_state.freq / trget_level) >> 7;
     uint feedback = (((int32_t)audio_state.freq + adjust) << 14u) / 1000u;
 
     //フィードバックの最大値,最小値
@@ -751,10 +757,67 @@ void usb_sound_card_init() {
     usb_device_start();
 }
 
+void core1_main(void){
+    int dma_sample[2];
+    bool mute = false;
+    int buf_length;
+    static int32_t dma_buff[2][I2S_DEQUEUE_LEN * 4];
+    uint8_t dma_use = 0;
+    int i2s_dma_chan = i2s_get_dma_ch();
+    I2S_MODE i2s_mode = i2s_get_i2s_mode();
+
+    int sample;
+    int32_t buf_l[I2S_DEQUEUE_LEN], buf_r[I2S_DEQUEUE_LEN];
+
+    int words_per_frame = 2;
+    if (i2s_mode == MODE_PT8211_DUAL || i2s_mode == MODE_I2S_DUAL) {
+        words_per_frame = 4;
+    }
+
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+
+    while (1){
+        buf_length = i2s_get_queue_length();
+        // printf("%3d\n", buf_length);
+
+        if (buf_length == 0 && mute == false){
+            mute = true;
+            gpio_put(PICO_DEFAULT_LED_PIN, 0);
+        }
+        else if (buf_length >= (I2S_DEQUEUE_LEN * 2) && mute == true){
+            mute = false;
+            gpio_put(PICO_DEFAULT_LED_PIN, 1);
+        }
+
+        if (mute == false){
+            sample = i2s_dequeue(buf_l, buf_r, I2S_DEQUEUE_LEN);
+            dma_sample[dma_use] = i2s_format_piodata(buf_l, buf_r, sample, dma_buff[dma_use]);
+            if (sample < I2S_DEQUEUE_LEN){
+                for (int i = dma_sample[dma_use]; i < I2S_DEQUEUE_LEN * words_per_frame; i++){
+                    dma_buff[dma_use][i] = 0;
+                }
+                mute = true;
+                gpio_put(PICO_DEFAULT_LED_PIN, 0);
+            }
+        }
+        else{
+            for (int i = 0; i < I2S_DEQUEUE_LEN * words_per_frame; i++){
+                dma_buff[dma_use][i] = 0;
+            }
+        }
+        dma_sample[dma_use] = I2S_DEQUEUE_LEN * words_per_frame;
+
+        dma_channel_wait_for_finish_blocking(i2s_dma_chan);
+        dma_channel_transfer_from_buffer_now(i2s_dma_chan, dma_buff[dma_use], dma_sample[dma_use]);
+        dma_use ^= 1;
+    }
+}
+
 int main(void) {
     set_sys_clock_khz(150000, true);
     //uartの設定よりも前に呼び出す
-    i2s_mclk_set_config(pio0, 0, dma_claim_unused_channel(true), false, CLOCK_MODE_LOW_JITTER, MODE_I2S);
+    i2s_mclk_set_config(pio0, CLOCK_MODE_LOW_JITTER, MODE_I2S);
     stdout_uart_init();
 
     //シリアルナンバーを取得
@@ -778,6 +841,9 @@ int main(void) {
     //i2s init
     i2s_mclk_set_pin(18, 20, 22);
     i2s_mclk_init(audio_state.freq);
+
+    //i2s_mclk_initより後に呼び出す
+    multicore_launch_core1(core1_main);
     
     usb_sound_card_init();
 
