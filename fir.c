@@ -32,6 +32,8 @@
  * 
  */
 
+#include <stdio.h>
+#include <stdatomic.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "hardware/dma.h"
@@ -41,9 +43,8 @@
 #include "fir.h"
 
 static int doorbell_dsp;
-static uint32_t sample_r;
-static q31_t buff_r[(48 + 8) * 8];
-static float32_t dsp_buff_r_1[(48 + 8) * 8];
+static q31_t buff_r[I2S_DEQUEUE_LEN * 8];
+static float32_t dsp_buff_r_1[I2S_DEQUEUE_LEN * 8];
 
 //48*8
 static arm_fir_interpolate_instance_f32 s_r_1st;
@@ -71,30 +72,32 @@ void dsp_init(void){
     arm_fir_interpolate_init_f32(&s_r_2nd_96, 2, FIR_2ND_140DB_96_TAPS, fir_2nd_140db_96, state_r_2nd_96, FIR_2ND_96_BLOCK_SIZE);
 }
 
-void __not_in_flash_func(core0_task)(void){
+void __not_in_flash_func(dsp_core0_task)(void){
     if (multicore_doorbell_is_set_current_core(doorbell_dsp)){
-        float32_t dsp_buff_r_2[(48 + 8) * 8];
+        uint32_t freq = dsp_get_freq();
+        int sample = I2S_DEQUEUE_LEN;
+        float32_t dsp_buff_r_2[I2S_DEQUEUE_LEN * 8];
         #if 1
-        if (sample_r <= (48 + 8)){
-            arm_scale_f32(dsp_buff_r_1, 8.0, dsp_buff_r_1, sample_r);
+        if (freq <= 48000){
+            arm_scale_f32(dsp_buff_r_1, 8.0, dsp_buff_r_1, sample);
 
-            arm_fir_interpolate_f32(&s_r_1st, dsp_buff_r_1, dsp_buff_r_2, sample_r);
-            sample_r *= 2;
-            arm_fir_interpolate_f32(&s_r_2nd, dsp_buff_r_2, dsp_buff_r_1, sample_r);
-            sample_r *= 4;
+            arm_fir_interpolate_f32(&s_r_1st, dsp_buff_r_1, dsp_buff_r_2, sample);
+            sample *= 2;
+            arm_fir_interpolate_f32(&s_r_2nd, dsp_buff_r_2, dsp_buff_r_1, sample);
+            sample *= 4;
         }
         else{
-            arm_scale_f32(dsp_buff_r_1, 4.0, dsp_buff_r_1, sample_r);
+            arm_scale_f32(dsp_buff_r_1, 4.0, dsp_buff_r_1, sample);
 
-            arm_fir_interpolate_f32(&s_r_1st_96, dsp_buff_r_1, dsp_buff_r_2, sample_r);
-            sample_r *= 2;
-            arm_fir_interpolate_f32(&s_r_2nd_96, dsp_buff_r_2, dsp_buff_r_1, sample_r);
-            sample_r *= 2;
+            arm_fir_interpolate_f32(&s_r_1st_96, dsp_buff_r_1, dsp_buff_r_2, sample);
+            sample *= 2;
+            arm_fir_interpolate_f32(&s_r_2nd_96, dsp_buff_r_2, dsp_buff_r_1, sample);
+            sample *= 2;
         }
-        arm_float_to_q31(dsp_buff_r_1, buff_r, sample_r);
+        arm_float_to_q31(dsp_buff_r_1, buff_r, sample);
         #else
-        if (sample_r <= (48 + 8)){
-            for (int i = 0, j = 0; i < sample_r; i++){
+        if (freq <= 48000){
+            for (int i = 0, j = 0; i < sample; i++){
                 dsp_buff_r_2[j++] = dsp_buff_r_1[i];
                 dsp_buff_r_2[j++] = dsp_buff_r_1[i];
                 dsp_buff_r_2[j++] = dsp_buff_r_1[i];
@@ -104,34 +107,36 @@ void __not_in_flash_func(core0_task)(void){
                 dsp_buff_r_2[j++] = dsp_buff_r_1[i];
                 dsp_buff_r_2[j++] = dsp_buff_r_1[i];
             }
-            sample_r *= 8;
+            sample *= 8;
         }
         else {
-            for (int i = 0, j = 0; i < sample_r; i++){
+            for (int i = 0, j = 0; i < sample; i++){
                 dsp_buff_r_2[j++] = dsp_buff_r_1[i];
                 dsp_buff_r_2[j++] = dsp_buff_r_1[i];
                 dsp_buff_r_2[j++] = dsp_buff_r_1[i];
                 dsp_buff_r_2[j++] = dsp_buff_r_1[i];
             }
-            sample_r *= 4;
+            sample *= 4;
         }
-        arm_float_to_q31(dsp_buff_r_2, buff_r, sample_r);
+        arm_float_to_q31(dsp_buff_r_2, buff_r, sample);
         #endif
         multicore_doorbell_clear_current_core(doorbell_dsp);
     }
 }
 
-void __not_in_flash_func(core1_main)(void){
-    int32_t* buff;
-    int dma_sample[2], sample;
+void __not_in_flash_func(dsp_core1_main)(void){
+    int dma_sample[2];
     bool mute = false;
-    int32_t mute_buff[96 * 2] = {0};
-    uint32_t mute_len = sizeof(mute_buff) / sizeof(int32_t);
-    int8_t buf_length;
-    int32_t dma_buff[2][(48 + 8) * 8 * 2];
+    int buf_length;
+    static int32_t dma_buff[2][I2S_DEQUEUE_LEN * 4 * 8];
     uint8_t dma_use = 0;
-    int dma_ch = 0;
-    uint32_t previous_length = 44 * 2;
+    int i2s_dma_chan = i2s_get_dma_ch();
+    I2S_MODE i2s_mode = i2s_get_i2s_mode();
+    
+    int sample;
+    int32_t buf_l[I2S_DEQUEUE_LEN], buf_r[I2S_DEQUEUE_LEN];
+
+    uint32_t freq;
 
     //48*8
     arm_fir_interpolate_instance_f32 s_l_1st;
@@ -149,55 +154,70 @@ void __not_in_flash_func(core1_main)(void){
     arm_fir_interpolate_init_f32(&s_l_1st_96, 2, FIR_1ST_140DB_96_TAPS, fir_1st_140db_96, state_l_1st_96, FIR_1ST_96_BLOCK_SIZE);
     arm_fir_interpolate_init_f32(&s_l_2nd_96, 2, FIR_2ND_140DB_96_TAPS, fir_2nd_140db_96, state_l_2nd_96, FIR_2ND_96_BLOCK_SIZE);
 
-    //gpio_init(15);
-    //gpio_set_dir(15, GPIO_OUT);
+    // gpio_init(15);
+    // gpio_set_dir(15, GPIO_OUT);
+
+    // int words_per_frame = 2;
+    // if (i2s_mode == MODE_PT8211_DUAL || i2s_mode == MODE_I2S_DUAL) {
+    //     words_per_frame = 4;
+    // }
+
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
 
     while (1){
-        static float32_t dsp_buff_l_1[(48 + 8) * 8];
-        static float32_t dsp_buff_l_2[(48 + 8) * 8];
-        static q31_t buff_l[(48 + 8) * 8];
+        static float32_t dsp_buff_l_1[I2S_DEQUEUE_LEN * 8];
+        static float32_t dsp_buff_l_2[I2S_DEQUEUE_LEN * 8];
+        static q31_t buff_l[I2S_DEQUEUE_LEN * 8];
 
-        //gpio_put(15, 1);
-        buf_length = i2s_get_buf_length();
+        // gpio_put(15, 1);
 
-        if (buf_length == 0){
+        buf_length = i2s_get_queue_length();
+        // printf("%3d\n", buf_length);
+        // if (buf_length > I2S_DEQUEUE_LEN * 2 && buf_length < I2S_DEQUEUE_LEN * 7){
+        //     gpio_put(15, 1);
+        // }
+        // else{
+        //     gpio_put(15, 0);
+        // }
+
+        if (buf_length == 0 && mute == false){
             mute = true;
             gpio_put(PICO_DEFAULT_LED_PIN, 0);
-            ///set_playback_state(false);
         }
-        else if (buf_length >= I2S_START_LEVEL && mute == true){
+        else if (buf_length >= (I2S_DEQUEUE_LEN * 2) && mute == true){
             mute = false;
             gpio_put(PICO_DEFAULT_LED_PIN, 1);
-            //set_playback_state(true);
         }
 
-        if (mute == true){
-            buff = mute_buff;
-            sample = previous_length;
-        }
-        else if (i2s_dequeue(&buff, &sample) == false){
-            buff = mute_buff;
-            sample = previous_length;
+        if (mute == false){
+            sample = i2s_dequeue(buf_l, buf_r, I2S_DEQUEUE_LEN);
+            if (sample < I2S_DEQUEUE_LEN){
+                for (int i = sample; i < I2S_DEQUEUE_LEN; i++){
+                    buf_l[i] = 0;
+                    buf_r[i] = 0;
+                }
+                mute = true;
+                gpio_put(PICO_DEFAULT_LED_PIN, 0);
+            }
         }
         else{
-            previous_length = sample;
+            for (int i = 0; i < I2S_DEQUEUE_LEN; i++){
+                buf_l[i] = 0;
+                buf_r[i] = 0;
+            }
         }
+        sample = I2S_DEQUEUE_LEN;
 
         //int32_tをfloat32_tに変換
-        arm_q31_to_float(buff, dsp_buff_l_2, sample);
-        
-        //左右に分割
-        sample /= 2;
-        for (int i = 0, j = 0; i < sample; i++){
-            dsp_buff_l_1[i] = dsp_buff_l_2[j++];
-            dsp_buff_r_1[i] = dsp_buff_l_2[j++];
-        }
-        sample_r = sample;
+        arm_q31_to_float(buf_l, dsp_buff_l_1, sample);
+        arm_q31_to_float(buf_r, dsp_buff_r_1, sample);
+        freq = dsp_get_freq();
 
         //core0_task開始
         multicore_doorbell_set_other_core(doorbell_dsp);
 
-        if (sample <= (48 + 8)){
+        if (freq <= 48000){
             arm_scale_f32(dsp_buff_l_1, 8.0, dsp_buff_l_1, sample);
 
             arm_fir_interpolate_f32(&s_l_1st, dsp_buff_l_1, dsp_buff_l_2, sample);
@@ -226,10 +246,20 @@ void __not_in_flash_func(core1_main)(void){
             dma_buff[dma_use][j++] = buff_r[i];
         }
         dma_sample[dma_use] = sample * 2;
-        //gpio_put(15, 0);
+        // gpio_put(15, 0);
 
-        dma_channel_wait_for_finish_blocking(dma_ch);
-        dma_channel_transfer_from_buffer_now(dma_ch, dma_buff[dma_use], dma_sample[dma_use]);
+        dma_channel_wait_for_finish_blocking(i2s_dma_chan);
+        dma_channel_transfer_from_buffer_now(i2s_dma_chan, dma_buff[dma_use], dma_sample[dma_use]);
         dma_use ^= 1;
     }
+}
+
+static atomic_uint dsp_freq = 44100;
+
+void dsp_set_freq(uint32_t freq){
+    atomic_store(&dsp_freq, freq);
+}
+
+uint32_t dsp_get_freq(void){
+    return atomic_load(&dsp_freq);
 }
