@@ -440,8 +440,8 @@ static void _as_audio_packet(struct usb_endpoint *ep) {
     DEBUG_PINS_CLR(audio_timing, 1);
     assert(!(usb_buffer->data_len & 3u));
 
-    int32_t buf_l[I2S_QUEUE_MAX];
-    int32_t buf_r[I2S_QUEUE_MAX];
+    static int32_t buf_l[I2S_QUEUE_MAX];
+    static int32_t buf_r[I2S_QUEUE_MAX];
     int length = i2s_unpack_uacdata(usb_buffer->data, usb_buffer->data_len, audio_state.resolution, buf_l, buf_r);
     i2s_volume(buf_l, buf_r, length);
     i2s_enqueue(buf_l, buf_r, length);
@@ -767,7 +767,7 @@ void core1_main(void){
     I2S_MODE i2s_mode = i2s_get_i2s_mode();
 
     int sample;
-    int32_t buf_l[I2S_DEQUEUE_LEN], buf_r[I2S_DEQUEUE_LEN];
+    static int32_t buf_l[I2S_DEQUEUE_LEN], buf_r[I2S_DEQUEUE_LEN];
 
     int words_per_frame = 2;
     if (i2s_mode == MODE_PT8211_DUAL || i2s_mode == MODE_I2S_DUAL) {
