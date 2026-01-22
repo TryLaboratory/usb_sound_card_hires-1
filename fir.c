@@ -23,15 +23,6 @@
  *
  */
 
-/**
- * @file fir.c
- * @author BambooMaster (https://misskey.hakoniwa-project.com/@BambooMaster)
- * @brief usb_sound_card_hires
- * @version 0.4-interpolation
- * @date 2025-04-22
- * 
- */
-
 #include <stdio.h>
 #include <stdatomic.h>
 #include "pico/stdlib.h"
