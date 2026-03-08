@@ -60,6 +60,8 @@ target_compile_definitions(usb_sound_card_hires PRIVATE
         PICO_AUDIO_I2S_MONO_INPUT=0
 )
 
+set(I2S_MAX_FREQ_KHZ 96)
+set(I2S_QUEUE_LEN 10)
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/pico-i2s-pio)
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/CMSIS-DSP)
 
