@@ -47,6 +47,8 @@ static char *descriptor_strings[] =
 
 #define ENDPOINT_FREQ_CONTROL 1u
 
+#define DEQUEUE_MAX_LEN   (96 / 2 + 1)
+
 struct audio_device_config {
     struct usb_configuration_descriptor descriptor;
     struct usb_interface_descriptor ac_interface;
@@ -452,7 +454,7 @@ static void _as_sync_packet(struct usb_endpoint *ep) {
 
     // todo lie thru our teeth for now
     int length =  i2s_get_queue_length();
-    int trget_level = I2S_DEQUEUE_LEN * 5;
+    int trget_level = i2s_get_freq() * 3 / 2000;
     int32_t adjust = ((trget_level - length) * (int32_t)audio_state.freq / trget_level) >> 7;
     uint feedback = (((int32_t)audio_state.freq + adjust) << 14u) / 1000u;
 
@@ -749,58 +751,68 @@ void usb_sound_card_init() {
 }
 
 void core1_main(void){
-    int dma_sample[2];
+    int dma_sample;
     bool mute = false;
     int buf_length;
-    static int32_t dma_buff[2][I2S_DEQUEUE_LEN * 4];
+    static int32_t dma_buf_a[2][DEQUEUE_MAX_LEN * 2], dma_buf_b[2][DEQUEUE_MAX_LEN * 2];
     uint8_t dma_use = 0;
-    int i2s_dma_chan = i2s_get_dma_ch();
-    I2S_MODE i2s_mode = i2s_get_i2s_mode();
+    int dequeue_len;
 
     int sample;
-    static int32_t buf_l[I2S_DEQUEUE_LEN], buf_r[I2S_DEQUEUE_LEN];
-
-    int words_per_frame = 2;
-    if (i2s_mode == MODE_PT8211_DUAL || i2s_mode == MODE_I2S_DUAL) {
-        words_per_frame = 4;
-    }
+    int32_t i2s_buf_l[DEQUEUE_MAX_LEN], i2s_buf_r[DEQUEUE_MAX_LEN];
 
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
 
     while (1){
         buf_length = i2s_get_queue_length();
+        // 0.5ms分ずつi2sに送る
+        dequeue_len = i2s_get_freq() / 2000;
+        if (dequeue_len > DEQUEUE_MAX_LEN) {
+            dequeue_len = DEQUEUE_MAX_LEN;
+        }
+
         // printf("%3d\n", buf_length);
 
+        // i2sキューが一定以上溜まったらミュート解除
         if (buf_length == 0 && mute == false){
             mute = true;
             gpio_put(PICO_DEFAULT_LED_PIN, 0);
         }
-        else if (buf_length >= (I2S_DEQUEUE_LEN * 2) && mute == true){
+        else if (buf_length >= (dequeue_len * 3) && mute == true){
             mute = false;
             gpio_put(PICO_DEFAULT_LED_PIN, 1);
         }
 
         if (mute == false){
-            sample = i2s_dequeue(buf_l, buf_r, I2S_DEQUEUE_LEN);
-            dma_sample[dma_use] = i2s_format_piodata(buf_l, buf_r, sample, dma_buff[dma_use]);
-            if (sample < I2S_DEQUEUE_LEN){
-                for (int i = dma_sample[dma_use]; i < I2S_DEQUEUE_LEN * words_per_frame; i++){
-                    dma_buff[dma_use][i] = 0;
+            // i2sキューから取り出す
+            sample = i2s_dequeue(i2s_buf_l, i2s_buf_r, dequeue_len);
+
+            // キューから取り出したデータ量が要求より少ない場合は、0埋めしてミュート状態へ
+            if (sample < dequeue_len){
+                for (int i = sample; i < dequeue_len; i++){
+                    i2s_buf_l[i] = 0;
+                    i2s_buf_r[i] = 0;
                 }
+                sample = dequeue_len;
                 mute = true;
                 gpio_put(PICO_DEFAULT_LED_PIN, 0);
             }
         }
         else{
-            for (int i = 0; i < I2S_DEQUEUE_LEN * words_per_frame; i++){
-                dma_buff[dma_use][i] = 0;
+            // ミュート状態の時は0を送信
+            for (int i = 0; i < dequeue_len; i++){
+                i2s_buf_l[i] = 0;
+                i2s_buf_r[i] = 0;
             }
+            sample = dequeue_len;
         }
-        dma_sample[dma_use] = I2S_DEQUEUE_LEN * words_per_frame;
 
-        dma_channel_wait_for_finish_blocking(i2s_dma_chan);
-        dma_channel_transfer_from_buffer_now(i2s_dma_chan, dma_buff[dma_use], dma_sample[dma_use]);
+        // pio送信形式に変換
+        dma_sample = i2s_format_piodata(i2s_buf_l, i2s_buf_r, sample, dma_buf_a[dma_use], dma_buf_b[dma_use]);
+
+        // dmaが終わるまで待機
+        i2s_dma_transfer_blocking(dma_buf_a[dma_use], dma_buf_b[dma_use], dma_sample);
         dma_use ^= 1;
     }
 }
