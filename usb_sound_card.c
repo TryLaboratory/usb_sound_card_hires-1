@@ -4,15 +4,6 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-/**
- * @file usb_sound_card.c
- * @author BambooMaster (https://misskey.hakoniwa-project.com/@BambooMaster)
- * @brief usb_sound_card_hires
- * @version 0.5
- * @date 2025-05-05
- * 
- */
-
 #include <stdio.h>
 
 #include "pico/stdlib.h"
@@ -50,11 +41,13 @@ static char *descriptor_strings[] =
 #undef AUDIO_SAMPLE_FREQ
 #define AUDIO_SAMPLE_FREQ(frq) (uint8_t)(frq), (uint8_t)((frq >> 8)), (uint8_t)((frq >> 16))
 
-#define AUDIO_MAX_PACKET_SIZE ((96 + 1) * 4 * 2)
+#define AUDIO_MAX_PACKET_SIZE MAX((96 + 1) * 3 * 2, (48 + 1) * 4 * 2)
 #define FEATURE_MUTE_CONTROL 1u
 #define FEATURE_VOLUME_CONTROL 2u
 
 #define ENDPOINT_FREQ_CONTROL 1u
+
+#define DEQUEUE_MAX_LEN   (96 / 2 + 1)
 
 struct audio_device_config {
     struct usb_configuration_descriptor descriptor;
@@ -439,7 +432,12 @@ static void _as_audio_packet(struct usb_endpoint *ep) {
     // todo deal with blocking correctly
     DEBUG_PINS_CLR(audio_timing, 1);
     assert(!(usb_buffer->data_len & 3u));
-    i2s_enqueue(usb_buffer->data, usb_buffer->data_len, audio_state.resolution);
+
+    static int32_t buf_l[I2S_QUEUE_MAX];
+    static int32_t buf_r[I2S_QUEUE_MAX];
+    int length = i2s_unpack_uacdata(usb_buffer->data, usb_buffer->data_len, audio_state.resolution, buf_l, buf_r);
+    i2s_volume(buf_l, buf_r, length);
+    i2s_enqueue(buf_l, buf_r, length);
 
     // keep on truckin'
     usb_grow_transfer(ep->current_transfer, 1);
@@ -455,8 +453,9 @@ static void _as_sync_packet(struct usb_endpoint *ep) {
     buffer->data_len = 3;
 
     // todo lie thru our teeth for now
-    uint8_t length =  i2s_get_buf_length();
-    int32_t adjust = ((I2S_TARGET_LEVEL - (int32_t)length) * (int32_t)audio_state.freq / I2S_BUF_DEPTH) >> 7;
+    int length =  i2s_get_queue_length();
+    int trget_level = i2s_get_freq() * 3 / 2000;
+    int32_t adjust = ((trget_level - length) * (int32_t)audio_state.freq / trget_level) >> 7;
     uint feedback = (((int32_t)audio_state.freq + adjust) << 14u) / 1000u;
 
     //フィードバックの最大値,最小値
@@ -751,10 +750,77 @@ void usb_sound_card_init() {
     usb_device_start();
 }
 
+void core1_main(void){
+    int dma_sample;
+    bool mute = false;
+    int buf_length;
+    static int32_t dma_buf_a[2][DEQUEUE_MAX_LEN * 2], dma_buf_b[2][DEQUEUE_MAX_LEN * 2];
+    uint8_t dma_use = 0;
+    int dequeue_len;
+
+    int sample;
+    int32_t i2s_buf_l[DEQUEUE_MAX_LEN], i2s_buf_r[DEQUEUE_MAX_LEN];
+
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+
+    while (1){
+        buf_length = i2s_get_queue_length();
+        // 0.5ms分ずつi2sに送る
+        dequeue_len = i2s_get_freq() / 2000;
+        if (dequeue_len > DEQUEUE_MAX_LEN) {
+            dequeue_len = DEQUEUE_MAX_LEN;
+        }
+
+        // printf("%3d\n", buf_length);
+
+        // i2sキューが一定以上溜まったらミュート解除
+        if (buf_length == 0 && mute == false){
+            mute = true;
+            gpio_put(PICO_DEFAULT_LED_PIN, 0);
+        }
+        else if (buf_length >= (dequeue_len * 3) && mute == true){
+            mute = false;
+            gpio_put(PICO_DEFAULT_LED_PIN, 1);
+        }
+
+        if (mute == false){
+            // i2sキューから取り出す
+            sample = i2s_dequeue(i2s_buf_l, i2s_buf_r, dequeue_len);
+
+            // キューから取り出したデータ量が要求より少ない場合は、0埋めしてミュート状態へ
+            if (sample < dequeue_len){
+                for (int i = sample; i < dequeue_len; i++){
+                    i2s_buf_l[i] = 0;
+                    i2s_buf_r[i] = 0;
+                }
+                sample = dequeue_len;
+                mute = true;
+                gpio_put(PICO_DEFAULT_LED_PIN, 0);
+            }
+        }
+        else{
+            // ミュート状態の時は0を送信
+            for (int i = 0; i < dequeue_len; i++){
+                i2s_buf_l[i] = 0;
+                i2s_buf_r[i] = 0;
+            }
+            sample = dequeue_len;
+        }
+
+        // pio送信形式に変換
+        dma_sample = i2s_format_piodata(i2s_buf_l, i2s_buf_r, sample, dma_buf_a[dma_use], dma_buf_b[dma_use]);
+
+        // dmaが終わるまで待機
+        i2s_dma_transfer_blocking(dma_buf_a[dma_use], dma_buf_b[dma_use], dma_sample);
+        dma_use ^= 1;
+    }
+}
+
 int main(void) {
     set_sys_clock_khz(150000, true);
     //uartの設定よりも前に呼び出す
-    i2s_mclk_set_config(pio0, 0, dma_claim_unused_channel(true), false, CLOCK_MODE_LOW_JITTER, MODE_I2S);
+    i2s_mclk_set_config(pio0, CLOCK_MODE_LOW_JITTER, MODE_I2S);
     stdout_uart_init();
 
     //シリアルナンバーを取得
@@ -778,6 +844,9 @@ int main(void) {
     //i2s init
     i2s_mclk_set_pin(18, 20, 22);
     i2s_mclk_init(audio_state.freq);
+
+    //i2s_mclk_initより後に呼び出す
+    multicore_launch_core1(core1_main);
     
     usb_sound_card_init();
 
